@@ -1,0 +1,1274 @@
+---
+title: "Development of the Left Arcuate Fasciculus is Linked to Learning Gains in Reading, but not Math"
+author: "Ethan Roy"
+date: "10/7/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# import libraries
+# library(plyr)
+library(dplyr)
+library(tidyverse)
+library(itsadug)
+
+library(lme4)
+library(lmerTest)
+library(patchwork)
+library(ggsci)
+library(broom)
+library(psych)
+library(mgcv)
+library(gratia)
+library(mlVAR)
+library(readxl)
+library(ggpubr)
+
+# icc = performance::icc
+rename = dplyr::rename
+summarise = dplyr::summarise
+select = dplyr::select
+mutate = dplyr::mutate
+
+```
+
+# Load and Wrangle Data
+
+```{r load data, include=F}
+
+# Load harmonized mean diffusion metrics
+full_df_harm = read_csv('/home/users/ethanroy/vanderbilt_colab/data/full_df_harm.csv') 
+
+# Load harmonized tract profile data
+full_profile_harm_df = read_csv('/home/users/ethanroy/vanderbilt_colab/data/full_profile_harm_df.csv')
+
+# pull behavioral data from combined dataframe
+wj_combo = full_df_harm %>% 
+  select(subjectID, sessionID, Age, WJ_read_w,WJ_math_sum,
+         Sex, WJ_read_C, WJ_math_C, scanner2, initial_age, age_c) %>% 
+  unique()
+
+# Generate a list of participants with at least 3 observations
+sub_df_3obs = full_profile_harm_df %>% 
+  select(subjectID,sessionID) %>% 
+  unique() %>% 
+  group_by(subjectID) %>% 
+  mutate(nObs=n()) %>% 
+  ungroup() %>% 
+  select(subjectID, nObs) %>% 
+  unique() %>% 
+  filter(nObs >= 3)
+
+# These participants have siblings in the data, so drop them just to be safe
+drop_sibs = c('RC3011','RC3043','RC3069', 'LD4029', 'LD4059', 'LD4080', 'LD4081')
+
+# Generate dataframe for just the left arcuate
+arc_l_df_harm = full_profile_harm_df %>% 
+  ungroup() %>% 
+  filter(tractID=='ARC_L') %>% 
+  filter((nodeID>19)&(nodeID<80)) %>%
+  dplyr::mutate(Age = as.numeric(Age),
+         subjectID = as.factor(subjectID),
+         sessionID = as.factor(sessionID)) %>% 
+  group_by(subjectID) %>%
+  dplyr::mutate(initial_age = min(Age),
+         age_c = Age - min(Age),
+         mean_read = mean(WJ_read_w),
+         mean_math = mean(WJ_math_sum),
+         scanner2 = as.factor(scanner2),
+         nodeID_fact = as.factor(nodeID)) %>% 
+  ungroup() %>% 
+  filter(!is.na(mean_read)) %>% 
+  rename(handedness = `Edinburgh Handedness Inventory Percentile`) %>% 
+  mutate(mean_read = scale(mean_read, center=T, scale=F),
+         handedness = scale(handedness, center=T, scale=F)) %>% 
+  filter(!(subjectID %in% drop_sibs))
+
+# Generate Right Arcuate data frame
+arc_r_df_harm = full_profile_harm_df %>% 
+  ungroup() %>% 
+  filter(tractID=='ARC_R') %>% 
+  filter((nodeID>19)&(nodeID<80)) %>%
+  dplyr::mutate(Age = as.numeric(Age),
+         subjectID = as.factor(subjectID),
+         sessionID = as.factor(sessionID)) %>% 
+  group_by(subjectID) %>%
+  dplyr::mutate(initial_age = min(Age),
+         age_c = Age - min(Age),
+         mean_read = mean(WJ_read_w),
+         mean_math = mean(WJ_math_sum),
+         scanner2 = as.factor(scanner2),
+         nodeID_fact = as.factor(nodeID)) %>% 
+  ungroup() %>% 
+  filter(!is.na(mean_read)) %>% 
+  rename(handedness = `Edinburgh Handedness Inventory Percentile`) %>% 
+  mutate(mean_read = scale(mean_read, center=T, scale=F),
+         handedness = scale(handedness, center=T, scale=F)) %>% 
+  filter(!(subjectID %in% drop_sibs))
+
+
+# generate new column indicating the start of each tract for each participant and
+# time point for setting up autocorrelations in GAMMs
+arc_l_df_harm$event = interaction(arc_l_df_harm$subjectID,arc_l_df_harm$sessionID,drop=T)
+arc_l_df_harm = arc_l_df_harm %>% mutate(start.event = if_else(nodeID==20,T,F))
+
+arc_r_df_harm$event = interaction(arc_r_df_harm$subjectID,arc_r_df_harm$sessionID,drop=T)
+arc_r_df_harm = arc_r_df_harm %>% mutate(start.event = if_else(nodeID==20,T,F))
+
+# Combined arcuate data
+arc_df_harm = arc_l_df_harm %>% rbind(arc_r_df_harm)
+
+
+```
+
+## Look at demographic and QC info
+
+```{r}
+
+
+behavioral = read_excel('/home/users/ethanroy/vanderbilt_colab/data/LD4_Behavioral.xlsx')%>% 
+  mutate( has_behav = if_else(is.na(`WJ-III Word Attack W Score`), 0, 1),
+          WJ_read = as.numeric(`WJ-III Word Attack W Score`),
+          WJ_math = as.numeric(`WJ-III Applied Problems W Score`)) %>% 
+  select(Participant, Visit, has_behav,Age, WJ_read, WJ_math) %>% 
+  rbind(read_excel('/home/users/ethanroy/vanderbilt_colab/data/RC3_Behavioral.xlsx') %>% 
+          mutate( has_behav = if_else(is.na(`WJ-IV Basic Reading Skills W Score`), 0, 1),
+                  WJ_read = as.numeric(`WJ-IV Basic Reading Skills W Score`),
+                  WJ_math = as.numeric(`WJ-IV Mathematics W Score`)) %>% 
+  select(Participant, Visit, has_behav,Age, WJ_read, WJ_math)) %>% 
+  mutate(Age = as.numeric(Age))
+
+demo_df = read_excel('/home/users/ethanroy/vanderbilt_colab/data/LD4_RC3_Demographics.xlsx') 
+
+qc_df = read_csv('/home/users/ethanroy/vanderbilt_colab/data/full_qc_df.csv')
+
+min(behavioral$Age, na.rm=T) # 6.42
+max(behavioral$Age, na.rm=T) # 11.42
+
+# mean age at initial visit
+behavioral %>% 
+  filter(Participant %in% substr(full_df_harm$subjectID, 3,7)) %>% 
+  filter(Visit==1) %>% 
+  summarise(mean_age = mean(Age, na.rm=T),
+            sd_age = sd(Age, na.rm=T))
+
+# mean reading/math scores at baseline
+behavioral %>% 
+  filter(Participant %in% substr(full_df_harm$subjectID, 3,7)) %>% 
+  filter(Visit==1) %>% 
+  summarise(mean_read = mean(WJ_read, na.rm=T),
+            sd_read = sd(WJ_read, na.rm=T),
+            mean_math = mean(WJ_math, na.rm=T),
+            sd_math = sd(WJ_math, na.rm=T))
+
+# Get sex counts at baseline
+demo_df %>% 
+   filter(Participant %in% substr(full_df_harm$subjectID, 3,7)) %>% 
+  group_by(Sex) %>% 
+  summarise(count=n())
+
+# Pull out QC stats
+qc_df %>% 
+  mutate(pass = if_else(rating>0, 'Pass','Fail')) %>% 
+  group_by(pass) %>% 
+  summarise(count=n())
+
+
+qc_df %>% 
+  mutate(subjectID = substr(subject, 1,10),
+         sessionID = substr(subject, 11,14)) %>% 
+  group_by(sessionID) %>% 
+  summarise(count=n())
+
+
+# get count of concurrent behavioral/neuroimaging ssessions
+behavioral %>% 
+  mutate(subjectID = if_else(substr(as.character(Participant),1,1)=='3',
+                                                 paste0('sub-RC',as.character(Participant)),
+                                                 paste0('sub-LD',as.character(Participant))),
+         sessionID = paste0('ses',as.character(Visit)))  %>% 
+  inner_join(qc_df %>% 
+  mutate(subjectID = substr(subject, 1,10),
+         sessionID = substr(subject, 11,14)),
+  by=c('sessionID','subjectID')) %>% 
+  select(subjectID, sessionID) %>% 
+  group_by(subjectID) %>% 
+  summarise(nObs=n())%>% 
+  group_by(nObs) %>% 
+  summarise(count=n())
+
+
+```
+
+
+
+# Within-Individual changes in reading skill track changes in the white matter properties of the left arcuate but not the right
+
+## GAMMs
+
+### Within-Individual Change Over time (time in study as Time Measure)
+
+```{r}
+# basic model -- linear effect of time, smooth over nodes
+m0 = bam(dti_md ~ initial_age + 
+                  age_c +
+                  s(nodeID),
+         data = arc_l_df_harm,
+         method='fREML')
+
+gam.check(m0) # looks okay
+
+# add random intercept
+m0.1 = bam(dti_md ~ initial_age + 
+                  age_c +
+                  s(nodeID) +
+                  s(subjectID, bs='re'),
+         data = arc_l_df_harm,
+         method='fREML')
+
+compareML(m0.1,m0) # Model m0.1 preferred: lower fREML score (3.863), and lower df (9.000).
+gam.check(m0.1) # looks okay
+
+
+# add random slope on nodes
+m0.2 = bam(dti_md ~ initial_age + 
+                  age_c +
+                  s(nodeID) +
+                  s(subjectID, bs='re')+
+                  s(nodeID, subjectID, bs='re'),
+         data = arc_l_df_harm,
+         method='fREML')
+
+compareML(m0.1,m0.2) # Model m0.2 preferred: lower fREML score (3.863), and lower df (9.000).
+gam.check(m0.2) # looks okay
+
+
+# add random slope on time
+m0.3 = bam(dti_md ~ initial_age + 
+                  age_c +
+                  s(nodeID) +
+                  s(subjectID, bs='re')+
+                  s(nodeID, subjectID, bs='re')+
+                  s(age_c, subjectID, bs='re'),
+         data = arc_l_df_harm,
+         method='fREML')
+
+compareML(m0.3,m0.2) # Model m0.3 preferred: lower AIC.
+anova(m0.3,m0.2)
+gam.check(m0.3) # looks okay
+
+# allow for non-linear development -- smooth on age
+m0.4 = bam(dti_md ~ initial_age + 
+                  s(age_c) +
+                  s(nodeID) +
+                  s(subjectID, bs='re')+
+                  s(nodeID, subjectID, bs='re')+
+                  s(age_c, subjectID, bs='re'),
+         data = arc_l_df_harm,
+         method='fREML')
+
+compareML(m0.3,m0.4) # Model m0.4 preferred: lower fREML score (3.863), and lower df (9.000).
+anova(m0.3, m0.4)
+gam.check(m0.4) # looks okay
+
+
+```
+
+#### Determine Autocorrelation For Simpler Growth Model
+
+```{r}
+# check autocorrelation -- might be some, let's model AR structure
+
+valrho   <- sort(c(seq(0,.7, by=.1), seq(.75,.85, by=.05), seq(.86,.99, by=.01) ))
+rho_df = data.frame()
+sum_df = data.frame()
+
+
+
+
+
+# different values of rho for models model1, and model2:
+pb <- txtProgressBar(style=3)
+for(i in 1:length(valrho)){
+	setTxtProgressBar(pb, i/length(valrho))
+  
+	suppressWarnings({
+  mod = bam(dti_md ~ initial_age +
+                  s(age_c, k = 18) +
+                  s(nodeID) +
+                  s(subjectID, bs='re')+
+                  s(nodeID, subjectID, bs='re')+
+                  s(age_c, subjectID, bs='re'),
+         discrete=T,
+         AR.start = arc_l_df_harm$start.event,
+         family='scat',
+         rho=valrho[i],
+         data = arc_l_df_harm,
+         method='fREML')
+    
+    rho_res = as.data.frame(k.check(mod)) %>%
+      rownames_to_column('term') %>%
+      mutate(rho = valrho[i],
+             freml =  as.vector(mod$gcv.ubre),
+             afc1 = acf_resid(mod, plot=F)[2],
+             cf1 = cor(mod$mod[,1], fitted(mod)))
+
+    rho_df = rho_df %>% rbind(rho_res)
+  
+		rm(mod)
+	})
+}
+
+  mod = bam(dti_md ~ initial_age +
+                    Sex +
+                    handedness +
+                  s(age_c) +
+                  s(nodeID) +
+                  s(subjectID, bs='re')+
+                  s(nodeID, subjectID, bs='re')+
+                  s(age_c, subjectID, bs='re'),
+         discrete=T,
+         AR.start = arc_l_df_harm$start.event,
+         family='scat',
+         rho=0,
+         data = arc_l_df_harm,
+         method='fREML')
+
+rho1 <- start_value_rho(mod)
+
+m0.5 = bam(dti_md ~ initial_age +
+                    Sex +
+                    handedness +
+                  s(age_c) +
+                  s(nodeID) +
+                  s(subjectID, bs='re')+
+                  s(nodeID, subjectID, bs='re')+
+                  s(age_c, subjectID, bs='re'),
+         discrete=T,
+         AR.start = arc_l_df_harm$start.event,
+         family='scat',
+         rho=rho1,
+         data = arc_l_df_harm,
+         method='fREML')
+
+measures=list()
+measures[[1]] <- list(rho=rho1, reml=as.vector(m0.5$gcv.ubre), cf=cor(m0.5$mod[,1], fitted(m0.5)))
+
+rho_df %>% 
+  select(rho,freml) %>% 
+  unique() %>% 
+  # mutate(freml = if_else(freml<0, 10e-6,freml)) %>%  # to prevent nan errors
+  ggplot(aes(x=rho,y=freml))+
+  geom_line()+
+  geom_point(data=as.data.frame(measures), aes(x=rho, y=reml))
+
+rho_df %>% 
+  filter(!is.na(`p-value`)) %>% 
+  mutate(sig = as.factor(if_else(`p-value`<0.05,1,0))) %>% 
+    # mutate(freml = if_else(freml<0, 10e-6,freml)) %>%  # to prevent nan errors
+  ggplot(aes(x=rho,y=`k-index`))+
+  geom_line()+
+  geom_point(aes(color=sig))+
+  facet_grid(.~term)+
+  geom_vline(aes(xintercept = measures[[1]]$rho))
+
+
+arc_l_df_harm$m0.5_pred = predict(m0.5, newdata=arc_l_df_harm)
+
+
+```
+
+
+
+### Fit State-Trait GAMM To Examine Longitudinal Link Between Reading and White Matter
+
+#### Determine Autocorrelation For State-Trait Growth Model
+
+```{r}
+
+valrho   <- sort(c(seq(0,.7, by=.1), seq(.75,.85, by=.05), seq(.86,.99, by=.01) ))
+rho_df = data.frame()
+sum_df = data.frame()
+
+
+# different values of rho for models model1, and model2:
+pb <- txtProgressBar(style=3)
+for(i in 1:length(valrho)){
+	setTxtProgressBar(pb, i/length(valrho))
+  
+	suppressWarnings({
+  mod = bam(dti_md ~ initial_age + 
+                  mean_read +
+                  WJ_read_C + 
+                  Sex + 
+                  handedness +
+                  s(age_c, k=32) +
+                  s(nodeID) +
+                  s(subjectID, bs='re')+
+                  s(nodeID, subjectID, bs='re')+
+                  s(age_c, subjectID, bs='re'),
+         discrete=T,
+         family='scat',
+         rho=valrho[i],
+         data = arc_l_df_harm ,
+         method='fREML')
+    
+    rho_res = as.data.frame(k.check(mod)) %>%
+      rownames_to_column('term') %>%
+      mutate(rho = valrho[i],
+             freml =  as.vector(mod$gcv.ubre),
+             afc1 = acf_resid(mod, plot=F)[2],
+             cf1 = cor(mod$mod[,1], fitted(mod)))
+
+    rho_df = rho_df %>% rbind(rho_res)
+    
+		rm(mod)
+	})
+}
+
+mod_noac = bam(dti_md ~ initial_age +
+                  s(age_c, k = 18) +
+                  s(nodeID) +
+                  s(subjectID, bs='re')+
+                  s(nodeID, subjectID, bs='re')+
+                  s(age_c, subjectID, bs='re'),
+         discrete=T,
+         AR.start = arc_l_df_harm$start.event,
+         family='scat',
+         rho=0,
+         data = arc_l_df_harm,
+         method='fREML')
+
+rho1 <- start_value_rho(mod_noac)
+
+mod1.0 = bam(dti_md ~ initial_age + 
+                  mean_read +
+                  WJ_read_C + 
+                  Sex + 
+                  handedness +
+                  s(age_c, k=32) +
+                  s(nodeID) +
+                  s(subjectID, bs='re')+
+                  s(nodeID, subjectID, bs='re')+
+                  s(age_c, subjectID, bs='re'),
+         discrete=T,
+         rho=rho1,
+         family='scat',
+         data = arc_l_df_harm ,
+         method='fREML')
+
+measures=list()
+measures[[1]] <- list(rho=rho1, reml=as.vector(mod1.0$gcv.ubre), cf=cor(mod1.0$mod[,1], fitted(mod1.0)))
+
+rho_df %>% 
+  select(rho,freml) %>% 
+  unique() %>% 
+  # mutate(freml = if_else(freml<0, 10e-6,freml)) %>%  # to prevent nan errors
+  ggplot(aes(x=rho,y=log(freml)))+
+  geom_line()+
+  geom_point(data=as.data.frame(measures), aes(x=rho, y=log(reml)))
+
+rho_df %>% 
+  filter(!is.na(`p-value`)) %>% 
+  mutate(sig = as.factor(if_else(`p-value`<0.05,1,0))) %>% 
+    # mutate(freml = if_else(freml<0, 10e-6,freml)) %>%  # to prevent nan errors
+  ggplot(aes(x=rho,y=`k-index`))+
+  geom_line()+
+  geom_point(aes(color=sig))+
+  facet_grid(.~term)+
+  geom_vline(aes(xintercept = measures[[1]]$rho),linetype=2)
+
+
+```
+
+```{r}
+
+m1 = bam(dti_md ~ initial_age + 
+                  mean_read +
+                  WJ_read_C + 
+                  Sex +
+                  handedness +
+                  s(age_c) +
+                  s(nodeID) +
+                  s(subjectID, bs='re')+
+                  s(nodeID, subjectID, bs='re')+
+                  s(age_c, subjectID, bs='re'),
+         discrete=T,
+         AR.start = arc_l_df_harm$start.event,
+         rho=0,
+         family='scat',
+         data = arc_l_df_harm ,
+         method='fREML')
+
+rho=start_value_rho(m1)
+
+# Add reading state/trait to model
+m1 = bam(dti_md ~ initial_age + 
+                  mean_read +
+                  WJ_read_C + 
+                  Sex +
+                  handedness +
+                  s(age_c, k=8) +
+                  s(nodeID) +
+                  s(subjectID, bs='re')+
+                  s(nodeID, subjectID, bs='re')+
+                  s(age_c, subjectID, bs='re'),
+         discrete=T,
+         AR.start = arc_l_df_harm$start.event,
+         rho=rho,
+         family='scat',
+         data = arc_l_df_harm ,
+         method='fREML')
+
+gam.check(m1) # looks okay
+anova(m0.5,m1, test='Chisq') # fits better
+
+summary(m1)
+
+
+m1.1 = bam(dti_md ~  initial_age + 
+             mean_read +
+             WJ_read_C + 
+             Sex +
+             handedness +
+             s(age_c,k=8) +
+             s(nodeID, k = 16) +
+             ti(nodeID, WJ_read_C)+
+             s(subjectID, bs='re')+
+             s(nodeID, subjectID, bs='re')+
+             s(age_c, subjectID, bs='re'),
+         discrete=T,
+         AR.start = arc_l_df_harm$start.event,
+         rho=0,
+         family='scat',
+         data = arc_l_df_harm %>% 
+           mutate(mean_read = as.numeric(mean_read),
+                  handedness = as.numeric(handedness)),
+         method='fREML')
+
+rho2=start_value_rho(m1.1)
+
+
+## Does WJ_read_C vary over the nodes? Add node*WJ_read_C smooth interaction
+m1.1 = bam(dti_md ~  initial_age + 
+             mean_read +
+             WJ_read_C + 
+             Sex +
+             handedness +
+             s(age_c,k=8) +
+             s(nodeID, k = 16) +
+             ti(nodeID, WJ_read_C)+
+             s(subjectID, bs='re')+
+             s(nodeID, subjectID, bs='re')+
+             s(age_c, subjectID, bs='re'),
+         discrete=T,
+         AR.start = arc_l_df_harm$start.event,
+         rho=rho2,
+         family='scat',
+         data = arc_l_df_harm %>% 
+           mutate(mean_read = as.numeric(mean_read),
+                  handedness = as.numeric(handedness)),
+         method='fREML')
+
+anova(m1, m1.1, test='Chisq') # not better
+gam.check(m1.1) 
+
+summary(m1.1)
+
+
+
+arc_l_df_harm$m1_pred = predict(m1.1, newdata=arc_l_df_harm)
+arc_l_df_harm$m1_resid = resid(m1.1, newdata=arc_l_df_harm)
+dfs1 <- smooth_estimates(m1.1) %>% add_confint(coverage=.68)
+
+
+
+```
+
+#### Check residuals of model
+
+```{r}
+
+
+m1.1_resid = bam(m1_resid ~   initial_age + 
+             mean_read +
+             WJ_read_C + 
+             Sex +
+             handedness +
+             s(age_c,k=8) +
+             s(nodeID, k = 16) +
+             ti(nodeID, WJ_read_C)+
+             s(subjectID, bs='re')+
+             s(nodeID, subjectID, bs='re')+
+             s(age_c, subjectID, bs='re'),
+         discrete=T,
+         AR.start = arc_l_df_harm$start.event,
+         rho=rho2,
+         family='scat',
+         data = arc_l_df_harm %>% 
+           mutate(mean_read = as.numeric(mean_read),
+                  handedness = as.numeric(handedness)),
+         method='fREML')
+
+# No wiggliness in residuals...
+summary(m1.1_resid)
+
+```
+
+
+## Figure 1
+
+### Figure 3 Plots
+```{r}
+
+
+mypal = pal_tw3("sky")(10)
+
+## Figure 1A - Tract profiles by within-individual reading
+pred_reading_plot = arc_l_df_harm %>% 
+  mutate(`Within-Individual Reading` = as.factor(ntile(WJ_read_C, n=4)),
+         m1_pred = m1_pred*1000) %>% 
+  group_by(nodeID, `Within-Individual Reading`) %>% 
+  summarise(mean_pred = mean(m1_pred,na.rm=T),
+            se = sd(m1_pred,na.rm=T)/sqrt(n())) %>% 
+  drop_na() %>% 
+  mutate(read_change_num = as.numeric(`Within-Individual Reading`),
+         `Within-Individual Reading` = case_when(`Within-Individual Reading` == '1' ~ 'Lowest',
+                                                 `Within-Individual Reading` == '2' ~ 'Low',
+                                                 `Within-Individual Reading` == '3' ~ 'High',
+                                                 `Within-Individual Reading` == '4' ~ 'Highest')) %>% 
+  mutate(`Within-Individual Reading` = factor(`Within-Individual Reading`,
+                                              levels=c("Highest","High","Low","Lowest"))) %>% 
+  ggplot(aes(x=nodeID, y = mean_pred, group=`Within-Individual Reading`))+
+  geom_line(aes(color=`Within-Individual Reading`))+
+  geom_ribbon(aes(fill = `Within-Individual Reading`, ymin=mean_pred-se, ymax=mean_pred+se),alpha=0.2)+
+  theme_bw()+
+  ylab(expression("Predicted Mean Diffusivity ("*mu*"m"^2*"/msec)"))+
+  xlab("Position Along Tract")+
+  scale_color_locuszoom()+
+  scale_fill_locuszoom() +
+  theme(legend.position = 'bottom')+
+  theme(text = element_text(size = 14))
+
+## Age Smoother -- Figure 1B
+age_smooth = filter(dfs1, .type != 'Random effect') %>%
+    filter(str_detect(.smooth, 's\\(age_c\\)'))%>%
+  mutate(.estimate=.estimate*10000,
+         .lower_ci = .lower_ci*10000,
+         .upper_ci = .upper_ci*10000) %>% 
+  ggplot(aes(x=age_c,y=.estimate)) +
+    geom_line(color = 'cyan')  +
+    geom_ribbon(aes(ymin = .lower_ci, ymax=.upper_ci),
+                fill='#c9f3fa',alpha = 0.4 )+
+    theme_bw()+
+  ylab(expression("Smooth Estimate ("*mu*"m"^2*"/msec)"))+
+  xlab("Time Since First Observation (Years)")+
+  theme(text = element_text(size = 14))
+
+
+## Cross-sectional Plot -- Figure 1C
+mean_read_plot = arc_l_df_harm %>% 
+  # filter(subjectID %in% sub_df_3obs$subjectID) %>% 
+  mutate(studyID=substr(subjectID,1,2)) %>%
+  mutate(sessionID=paste("Session",as.factor(sessionID)),
+         dti_md = dti_md*1000) %>% 
+  group_by(subjectID, sessionID) %>% 
+  summarise(mean_md = mean(dti_md, na.rm=T),
+            mean_read = mean_read) %>% 
+  ggplot(aes(x=mean_read,y = mean_md))+
+  geom_point()+
+  geom_smooth(method='lm', se=F)+
+  xlab("Average Reading Score")+
+  ylab(expression("Average MD ("*mu*"m"^2*"/msec)"))+
+  theme_bw()+
+  facet_grid(.~sessionID)+
+  theme(text = element_text(size = 14)) 
+
+# Put plot together
+(pred_reading_plot + age_smooth/mean_read_plot)+ 
+  plot_layout(widths = c(2, 1))+ 
+  plot_annotation(tag_levels = 'A') & 
+  theme(plot.tag = element_text(size = 20))
+
+```
+
+## Table 1
+```{r}
+
+flextable::as_flextable(m1.1)
+
+```
+
+# White matter properties and reading skill, but not mathematics, demonstrate between-individual differences in development over a four-year period
+
+### Reading Development
+
+```{r}
+reading_growth = wj_combo %>%
+    dplyr::mutate(Age = as.numeric(Age),
+         subjectID = as.factor(subjectID),
+         sessionID = as.factor(sessionID)) %>%
+  group_by(subjectID) %>% 
+  dplyr::mutate(initial_age = min(Age),
+         age_c = Age - min(Age)) %>%  
+  mutate(studyID=substr(subjectID,1,2)) %>%
+  ggplot(aes(x=age_c,y=WJ_read_w,group=subjectID))+
+  geom_line(alpha=0.2)+
+  geom_point(aes(color=Age))+
+  xlab("Time in Study (Years)")+
+  ylab("WJ Reading W Score")+
+  theme_bw()+
+  scale_color_bs5("purple")+
+  theme(text = element_text(size = 16))
+
+## Figure out how much variance in growth there is
+mod0 = lmer(WJ_read_w ~ age_c + (1|subjectID), 
+            wj_combo %>%
+              filter(subjectID %in% sub_df_3obs$subjectID) %>% 
+              group_by(subjectID) %>% 
+              dplyr::mutate(age_c =  as.numeric(Age) - min(as.numeric(Age))))
+
+mod1 = lmer(WJ_read_w ~  age_c + (age_c|subjectID),             
+            wj_combo %>%  
+              filter(subjectID %in% sub_df_3obs$subjectID) %>% 
+              group_by(subjectID) %>% 
+              dplyr::mutate(age_c =  as.numeric(Age) - min(as.numeric(Age))))
+
+# random slopes improve model fit -- significant variance in reading growth
+anova(mod0,mod1)
+
+```
+
+### Math Development
+
+```{r}
+math_growth = wj_combo %>%
+    dplyr::mutate(Age = as.numeric(Age),
+         subjectID = as.factor(subjectID),
+         sessionID = as.factor(sessionID)) %>%
+    group_by(subjectID) %>% 
+  dplyr::mutate(initial_age = min(Age),
+         age_c = Age - min(Age)) %>%  
+  mutate(sessionID=as.factor(sessionID)) %>% 
+  mutate(studyID=substr(subjectID,1,2)) %>%
+  ggplot(aes(x=age_c,y=WJ_math_sum,group=subjectID))+
+  geom_line(alpha=0.2)+
+  geom_point(aes(color=Age))+
+  xlab("Time in Study (Years)")+
+  ylab("WJ Math W Score")+
+  theme_bw()+
+  scale_color_bs5("purple")+
+  theme(text = element_text(size = 16))
+
+## Figure out how much variance in growth there is
+mod0 = lmer(WJ_math_sum ~ age_c + (1|subjectID), 
+            wj_combo %>%
+              filter(subjectID %in% sub_df_3obs$subjectID) %>% 
+              group_by(subjectID) %>% 
+              dplyr::mutate(age_c =  as.numeric(Age) - min(as.numeric(Age))))
+
+mod1 = lmer(WJ_math_sum ~  age_c + (age_c|subjectID),             
+            wj_combo %>%  
+              filter(subjectID %in% sub_df_3obs$subjectID) %>% 
+              group_by(subjectID) %>% 
+              dplyr::mutate(age_c =  as.numeric(Age) - min(as.numeric(Age))))
+
+# random slopes improve model fit -- no significant variance in math growth...
+anova(mod0,mod1)
+
+
+
+```
+
+### Mean Diffusivity Development
+
+```{r}
+pred_df = arc_l_df_harm %>% 
+  filter(tractID=='ARC_L') %>% 
+  mutate(sessionID=as.factor(sessionID)) %>% 
+  mutate(studyID=substr(subjectID,1,2)) %>%
+  pivot_longer(cols=c('dti_md'),
+               names_to = 'metric') %>% 
+  select(nodeID, sessionID, metric, value,studyID,m0.5_pred) %>% 
+  group_by(nodeID,sessionID,metric) %>% 
+  summarise(mean_val = mean(value, na.rm=T)*1000,
+            mean_pred = mean(m0.5_pred, na.rm=T)*1000)
+
+ind_prof_plot =  arc_l_df_harm %>% 
+  filter(tractID=='ARC_L') %>% 
+  mutate(sessionID=as.factor(sessionID),
+         Age = initial_age+as.numeric(age_c),
+         dti_md = dti_md*1000) %>% 
+  mutate(studyID=substr(subjectID,1,2)) %>% 
+  select(nodeID, subjectID, sessionID, dti_md, m0.5_pred,Age) %>% 
+  ggplot()+
+  geom_line(aes(x=nodeID,y=dti_md,
+                color=Age, group=interaction(subjectID, Age)),alpha=0.075)+
+    scale_color_bs5("purple")+
+  geom_line(data = pred_df,
+            aes(x = nodeID, y=mean_pred, linetype=sessionID))+
+  theme_bw()+
+  xlab('Position Along Tract')+
+  ylab(expression("Average MD ("*mu*"m"^2*"/msec)"))+
+  theme(text = element_text(size = 16))
+```
+
+
+## Figure 2
+
+```{r}
+
+(reading_growth + math_growth + ind_prof_plot +
+  plot_layout(guides = "collect")) + 
+  plot_annotation(tag_levels = 'A') & 
+  theme(plot.tag = element_text(size = 20))
+
+```
+
+### State-Trait Linear model from Roy et al. 2024
+
+```{r}
+
+reg_data = arc_l_df_harm %>% 
+    filter(subjectID %in% sub_df_3obs$subjectID) %>%
+  group_by(subjectID,sessionID,tractID) %>% 
+  reframe(mean_md_session = mean(dti_md,na.rm=T),
+          mean_fa_session = mean(dti_fa, na.rm=T),
+          WJ_read_w = WJ_read_w,
+          initial_age = initial_age,
+          age_c = age_c,
+          sessionID = as.numeric(sessionID)-1) %>% 
+  ungroup() %>% 
+  group_by(subjectID) %>% 
+  mutate(mean_md = mean(mean_md_session, na.rm=T),
+         mean_fa = mean(mean_fa_session, na.rm=T),
+         mean_reading = mean(WJ_read_w)) %>% 
+  mutate(demean_md = mean_md_session-mean_md,
+         demean_fa = mean_fa_session-mean_fa, 
+         demean_read = WJ_read_w-mean_reading,
+         sessionID = as.numeric(sessionID)) %>% 
+  unique()
+
+# Discrete Time 
+lme_mod = lmer(demean_read ~ sessionID + demean_md + initial_age + mean_md  + (sessionID|subjectID),data=reg_data)
+
+summary(lme_mod)
+
+# Continuous Time
+lme_mod_age_c = lmer(demean_read ~ age_c + demean_md + initial_age + mean_md  + (age_c|subjectID),
+                  data=reg_data)
+
+summary(lme_mod_age_c)
+
+```
+
+### Compare the Rates of Reading and MD Develompent
+
+```{r}
+# Raw Reading Scores
+lm_frame_slopes_read = full_df_harm %>%
+  filter(subjectID %in% sub_df_3obs$subjectID) %>%
+  mutate(sessionID = sessionID -1) %>% 
+  filter(tractID=='ARC_L')  %>% 
+  group_by(subjectID) %>%
+  do(fitSub = tidy(lm(WJ_reading_sum ~ sessionID, data = .))) %>% 
+  unnest(fitSub) %>% 
+  filter(term=="sessionID") %>% 
+  arrange(desc(estimate)) %>%
+  rename(read_estimate = estimate) %>% 
+  mutate(mean_read = mean(read_estimate,na.rm=T),
+         sd_read = sd(read_estimate, na.rm=T)) 
+
+lm_frame_slopes = full_df_harm %>%
+  filter(subjectID %in% sub_df_3obs$subjectID) %>%
+  mutate(sessionID = sessionID -1) %>% 
+  filter(tractID=='ARC_L') %>%
+  group_by(subjectID) %>%
+  do(fitSub = tidy(lm(mean_dtiMD ~ sessionID, data = .))) %>% 
+  unnest(fitSub) %>% 
+  filter(term=="sessionID") %>%
+  arrange(desc(estimate)) %>% 
+  mutate(sig = if_else(p.value < 0.05, 1, 0)) %>% 
+  mutate(mean_md = mean(estimate, na.rm=T),
+         sd_md = sd(estimate, na.rm=T))
+
+# Merge reading and MD developmental rate dfs
+plot_merged_read = full_df_harm %>%
+  filter(subjectID %in% sub_df_3obs$subjectID) %>%
+  filter(tractID=='ARC_L') %>%
+  inner_join(select(lm_frame_slopes, c("subjectID","estimate",'sig')),
+             by='subjectID')  %>%
+  inner_join(select(lm_frame_slopes_read, c("subjectID","read_estimate")),
+             by='subjectID') %>% 
+  filter(!is.na(estimate))%>%
+  filter(!is.na(read_estimate))%>%
+  mutate(estimate_scale = scale(estimate),
+         init_age_scale = scale(initial_age)) %>% 
+  select(subjectID, estimate, read_estimate,WJ_read_w) %>% 
+  unique()
+
+cor.test(plot_merged_read$estimate, plot_merged_read$read_estimate)
+
+```
+
+## Figure 3
+
+```{r}
+
+mean_centered_plot = full_df_harm %>%
+  filter(tractID=='ARC_L') %>%
+  filter(subjectID %in% sub_df_3obs$subjectID) %>% 
+  mutate(studyID=substr(subjectID,1,2)) %>%
+  mutate(sessionID=as.factor(sessionID)) %>% 
+  ggplot(aes(x=mean_dtiMD_C,y=WJ_read_C))+
+  geom_point(aes(color=sessionID))+
+  geom_smooth(aes(x=mean_dtiMD_C,y=WJ_read_C),method='lm')+
+  ylab("Demeaned WJ Reading")+
+  xlab("Demeaned Mean MD")+
+  theme_bw()+
+  theme(text = element_text(size = 18)) +
+  theme(legend.position = "bottom",
+        legend.text.size = element_text(size=12))+ 
+  guides(color = guide_legend(override.aes = list(size = 8)))
+
+rates_plot = plot_merged_read %>%
+  select(subjectID,estimate,read_estimate) %>% 
+  unique() %>% 
+  mutate(studyID=substr(subjectID,1,2)) %>% 
+  ggplot(aes(x=estimate,y=read_estimate))+
+  geom_point()+
+  geom_smooth(method='lm')+
+  xlab('Rate of MD Development in Left Arcuate')+
+  ylab('Rate of Reading Score Development')+
+  theme_bw()+
+  theme(text = element_text(size = 18))
+
+
+(mean_centered_plot + rates_plot)+ 
+  plot_annotation(tag_levels = 'A') & 
+  theme(plot.tag = element_text(size = 30))
+
+```
+
+# Gains in reading precede white matter development across the left arcuate
+
+## mlVAR
+
+```{r}
+
+Res1 <- mlVAR(full_df_harm %>% filter(tractID=='ARC_L'),
+c('mean_dtiMD','WJ_read_w'),
+           idvar="subjectID", lags = c(1),scale=T,
+           estimator='lmer',temporal = 'orthogonal')
+
+## These coefficients are used in Figure 4
+sumRes = summary(Res1)
+
+```
+
+## Bootstrapp Difference Test
+
+```{r}
+
+# Load pre-computed bootstrapped coefficients -- generated with          run_mlvar_boot.R
+t1_boot = read_csv('/home/users/ethanroy/vanderbilt_colab/data/mlvar_boot_arc_l.csv')
+
+# Generate dataframes for each pathway in model
+fa_to_fa_boot = t1_boot %>% 
+  filter(from == 'mean_dtiMD') %>% 
+  filter(to == 'mean_dtiMD') %>% 
+  mutate(P = as.numeric(P),
+         fixed = as.numeric(fixed))
+
+fa_to_towre_boot = t1_boot %>% 
+  filter(from == 'mean_dtiMD') %>% 
+  filter(to == 'WJ_read_w')%>% 
+  mutate(P = as.numeric(P),
+         fixed = as.numeric(fixed))
+
+towre_to_fa_boot = t1_boot %>% 
+  filter(from == 'WJ_read_w') %>% 
+  filter(to == 'mean_dtiMD')%>% 
+  mutate(P = as.numeric(P),
+         fixed = as.numeric(fixed))
+
+towre_to_towre_boot = t1_boot %>% 
+  filter(from == 'WJ_read_w') %>% 
+  filter(to == 'WJ_read_w')%>% 
+  mutate(P = as.numeric(P),
+         fixed = as.numeric(fixed))
+
+## Make path dfs wide format
+fa_to_fa_boot_wide = fa_to_fa_boot %>% 
+  unite('path',to:from,sep='_to_',remove=T) %>% 
+  dplyr::select(path,fixed) %>% 
+  dplyr::mutate(boot_no = 1:n()) %>% 
+  pivot_wider(id_cols = boot_no, names_from=path, values_from = fixed)
+
+fa_to_towre_boot_wide = fa_to_towre_boot %>% 
+  unite('path',to:from,sep='_to_',remove=T) %>% 
+  dplyr::select(path,fixed) %>% 
+  dplyr::mutate(boot_no = 1:n()) %>% 
+  pivot_wider(id_cols = boot_no, names_from=path, values_from = fixed)
+
+towre_to_fa_boot_wide = towre_to_fa_boot %>% 
+  unite('path',to:from,sep='_to_',remove=T) %>% 
+  dplyr::select(path,fixed) %>% 
+  dplyr::mutate(boot_no = 1:n()) %>% 
+  pivot_wider(id_cols = boot_no, names_from=path, values_from = fixed)
+
+towre_to_towre_boot_wide = towre_to_towre_boot %>% 
+  unite('path',to:from,sep='_to_',remove=T) %>% 
+  dplyr::select(path,fixed) %>% 
+  dplyr::mutate(boot_no = 1:n()) %>% 
+  pivot_wider(id_cols = boot_no, names_from=path, values_from = fixed)
+
+# combine all wide dfs into one
+path_diff_df = fa_to_fa_boot_wide %>% 
+  inner_join(fa_to_towre_boot_wide, by='boot_no')%>% 
+  inner_join(towre_to_fa_boot_wide, by='boot_no')%>% 
+  inner_join(towre_to_towre_boot_wide, by='boot_no')
+
+# Function for computing CI for path differences
+boot_diff_ci = function(df,col1,col2,alpha=0.975){
+  # this approach calculates the 95% CI around 
+  # the mean of difference in bootstrapped edges (col1 and col2)
+  ci_df = df %>% 
+    dplyr::mutate(diff = df[[col1]] - df[[col2]]) %>% 
+    dplyr::summarise(mean_diff = mean(diff, na.rm = TRUE),
+              sd_diff = sd(diff, na.rm = TRUE),
+              count = n()) %>%
+    dplyr::mutate(se_diff = sd_diff / sqrt(count),
+           lower.ci = mean_diff - qt(alpha,df=count-1)  * se_diff,
+           upper.ci = mean_diff + qt(alpha,df=count-1)  * se_diff)
+  
+  return(ci_df)
+}
+
+# Compute the difference between the WJ-MD path and the MD-WJ path
+boot_diff_ci(path_diff_df,"WJ_read_w_to_mean_dtiMD","mean_dtiMD_to_WJ_read_w")
+
+
+```
+
+
+# Supplemental Figures
+
+## Supplemental Figure 1
+
+```{r}
+
+full_profile_harm_df %>% 
+  filter(tractID=='ARC_L') %>% 
+  mutate(sessionID=as.factor(sessionID)) %>% 
+  mutate(studyID=substr(subjectID,1,2)) %>%
+  pivot_longer(cols=c('dti_fa','dti_md','dti_rd','dti_ad'),
+               names_to = 'metric') %>% 
+  select(nodeID, sessionID, metric, value,studyID) %>% 
+  group_by(nodeID,sessionID,metric) %>% 
+  summarise(mean_val = mean(value, na.rm=T),
+            se_val = sd(value, na.rm=T)/sqrt(n()))%>% 
+  filter(nodeID>20) %>%
+  filter(nodeID<80) %>%
+  ggplot(aes(x=nodeID, y=mean_val,group=sessionID))+
+  geom_line(aes(color=sessionID))+
+  geom_ribbon(aes(ymin=mean_val-se_val, ymax=mean_val+se_val,fill=sessionID),
+              alpha=0.2)+
+  facet_grid(metric~., scales='free')+
+  ylab("Mean Diffusion Metric")+
+  theme_bw()
+
+```
+
+
+## Supplemental Figure 2
+
+```{r}
+
+filter(dfs1, .type == 'Random effect') %>% 
+  filter(str_detect(.smooth, 's\\(age_c,subjectID\\)')) %>% 
+  inner_join(dfs1 %>% 
+               filter(str_detect(.smooth, 's\\(subjectID\\)')) %>% 
+               select(subjectID, .estimate) %>% 
+               rename(intercept=.estimate)) %>% 
+  filter(is.na(nodeID)) %>% 
+  group_by(subjectID) %>% 
+  mutate(.estimate=.estimate+intercept,
+         time = row_number())%>%
+  ggplot(aes(x = time, y = .estimate,group=subjectID)) +
+  geom_line()+
+  theme_bw()+
+  ggtitle("Estimated Random Effects")
+
+```
+
+
+## Supplemental Figure 3
+
+```{r}
+
+full_profile_raw_df = read_csv('/home/users/ethanroy/vanderbilt_colab/data/tract_profiles_filtered.csv')
+
+full_profile_harm_df %>% 
+  filter(tractID == 'ARC_L') %>% 
+  select(nodeID, dti_md,scanner,sessionID) %>% 
+  mutate(set = 'Harmonized') %>% 
+  rbind(full_profile_raw_df %>% 
+          filter(tractID == 'ARC_L') %>% 
+          inner_join(full_profile_harm_df %>%
+                       filter(tractID == 'ARC_L') %>% 
+                       select(subjectID, sessionID, scanner),
+                     by = c("sessionID",'subjectID')) %>% 
+          filter(tractID == 'ARC_L') %>% 
+          select(nodeID, dti_md,scanner,sessionID) %>% 
+          mutate(set = 'Raw')) %>% 
+  mutate(scanner = as.factor(scanner),
+         sessionID = paste0('Session ',as.character(sessionID))) %>% 
+  group_by(nodeID, scanner, sessionID,set) %>% 
+  summarise(mean_md = mean(dti_md, na.rm=T),
+            se_md = sd(dti_md, na.rm=T)/sqrt(n()))%>% 
+  ggplot(aes(x=nodeID, y = mean_md, color=scanner,fill=scanner))+
+  geom_line()+
+  facet_grid(set~sessionID)+
+  theme_bw()+
+  ylab('Mean Diffusivity')
+
+
+
+```
+
+
+## Supplemental Figure 4
+
+```{r}
+
+mean_read_df = plot_merged_read %>% 
+  select(subjectID, estimate, WJ_read_w) %>% 
+  group_by(subjectID, estimate, WJ_read_w) %>% 
+  summarise(mean_read = mean(WJ_read_w, na.rm=T))
+
+plot_merged_read %>% 
+  select(subjectID, estimate, WJ_read_w) %>% 
+  group_by(subjectID, estimate, WJ_read_w) %>% 
+  summarise(mean_read = mean(WJ_read_w, na.rm=T)) %>% 
+  ggplot(aes(x=mean_read, y = estimate))+
+  geom_point()+
+  geom_smooth(method='lm')+
+  theme_bw()+
+  xlab("Mean Reading Score")+
+  ylab("Rate of MD Development in Left Arcuate")+
+  stat_cor()
+
+```
+
+## Supplemental Table 1
+### Model the Right Arcuate
+
+```{r}
+
+
+m1.1 = bam(dti_md ~  initial_age + 
+             mean_read +
+             WJ_read_C + 
+             Sex +
+             handedness +
+             s(age_c,k=8) +
+             s(nodeID, k = 16) +
+             ti(nodeID, WJ_read_C)+
+             s(subjectID, bs='re')+
+             s(nodeID, subjectID, bs='re')+
+             s(age_c, subjectID, bs='re'),
+         discrete=T,
+         AR.start = arc_r_df_harm$start.event,
+         rho=0,
+         family='scat',
+         data = arc_r_df_harm %>% 
+           mutate(mean_read = as.numeric(mean_read),
+                  handedness = as.numeric(handedness)),
+         method='fREML')
+
+rho2=start_value_rho(m1.1)
+
+
+## Does WJ_read_C vary over the nodes? Add node*WJ_read_C smooth interaction
+m1.1 = bam(dti_md ~  initial_age + 
+             mean_read +
+             WJ_read_C + 
+             Sex +
+             handedness +
+             s(age_c,k=8) +
+             s(nodeID, k = 16) +
+             ti(nodeID, WJ_read_C)+
+             s(subjectID, bs='re')+
+             s(nodeID, subjectID, bs='re')+
+             s(age_c, subjectID, bs='re'),
+         discrete=T,
+         AR.start = arc_r_df_harm$start.event,
+         rho=rho2,
+         family='scat',
+         data = arc_r_df_harm %>% 
+           mutate(mean_read = as.numeric(mean_read),
+                  handedness = as.numeric(handedness)),
+         method='fREML')
+
+summary(m1.1)
+
+```
+
+
+# Supplemental Table 2
+### Model Math in Left Arcuate
+
+```{r}
+
+
+m1.1 = bam(dti_md ~  initial_age + 
+             mean_math +
+             WJ_math_C + 
+             Sex +
+             handedness +
+             s(age_c,k=8) +
+             s(nodeID, k = 16) +
+             ti(nodeID, WJ_read_C)+
+             s(subjectID, bs='re')+
+             s(nodeID, subjectID, bs='re')+
+             s(age_c, subjectID, bs='re'),
+         discrete=T,
+         AR.start = arc_l_df_harm$start.event,
+         rho=0,
+         family='scat',
+         data = arc_l_df_harm %>% 
+           mutate(mean_read = as.numeric(mean_read),
+                  handedness = as.numeric(handedness)),
+         method='fREML')
+
+rho2=start_value_rho(m1.1)
+
+
+## Does WJ_read_C vary over the nodes? Add node*WJ_read_C smooth interaction
+m1.1 = bam(dti_md ~  initial_age + 
+             mean_math +
+             WJ_math_C + 
+             Sex +
+             handedness +
+             s(age_c,k=8) +
+             s(nodeID, k = 16) +
+             ti(nodeID, WJ_read_C)+
+             s(subjectID, bs='re')+
+             s(nodeID, subjectID, bs='re')+
+             s(age_c, subjectID, bs='re'),
+         discrete=T,
+         AR.start = arc_l_df_harm$start.event,
+         rho=rho2,
+         family='scat',
+         data = arc_l_df_harm %>% 
+           mutate(mean_read = as.numeric(mean_read),
+                  handedness = as.numeric(handedness)),
+         method='fREML')
+
+summary(m1.1)
+
+```
+
