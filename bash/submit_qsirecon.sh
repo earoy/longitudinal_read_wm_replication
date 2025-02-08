@@ -9,9 +9,9 @@
 #SBATCH --output=array_%x_%A_%a.out
 #SBATCH --array=3-704%50
 
-# should be array=3-704%50
+# should be array=1-704%50
 echo “RUNNING QSIPREP on a single subjects”
-SUBJECTS_FILE='subjects.txt'
+SUBJECTS_FILE='/home/users/ethanroy/vanderbilt_colab/bash_scripts/revisions/subjects.txt'
 subject=$( sed "${SLURM_ARRAY_TASK_ID}q;d" ${SUBJECTS_FILE} )
 echo ${PWD}
 echo $subject
@@ -20,10 +20,16 @@ echo $subject
 # /scratch/users/ethanroy/singularity_images/qsiprep-0.16.1.sif
 
 export SINGULARITYENV_FS_LICENSE=/home/groups/jyeatman/software/freesurfer_license.txt
-singularity run --cleanenv /scratch/users/ethanroy/singularity_images/qsiprep_0.16.1.sif \
+export SINGULARITYENV_QSIRECON_ATLAS=/home/users/ethanroy/vanderbilt_colab/Atlas_ROIs
+
+singularity run --cleanenv /home/groups/jyeatman/software/singularity_images/qsiprep-0.19.0.simg \
 /scratch/users/ethanroy/longitudinal_vanderbilt_colab/input_fmap_rev \
-/scratch/users/ethanroy/longitudinal_vanderbilt_colab/input_fmap_rev/derivatives/  participant --participant-label $subject \
+/scratch/users/ethanroy/longitudinal_vanderbilt_colab/input_fmap_rev/derivatives  participant --participant-label $subject \
+--recon_input  /scratch/users/ethanroy/longitudinal_vanderbilt_colab/input_fmap_rev/derivatives/qsiprep \
 -w /scratch/groups/jyeatman/ethan/work_test \
 --nthreads 3 \
+--recon_only \
 --skip-odf-reports \
+--recon_spec /home/users/ethanroy/vanderbilt_colab/bash_scripts/revisions/pyafq_tractometry.json \
 --output-resolution 2.5 \
+

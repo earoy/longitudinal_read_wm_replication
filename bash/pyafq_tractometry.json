@@ -18,8 +18,8 @@
                 "sphere": "",
                 "seed_mask": "",
                 "seed_threshold": 0,
-                "n_seeds": 1,
-                "random_seeds": false,
+                "n_seeds": 200000,
+                "random_seeds": true,
                 "rng_seed": "",
                 "stop_mask": "",
                 "stop_threshold": 0,
@@ -73,7 +73,7 @@
                 "mapping_definition": "",
                 "reg_subject_spec": "power_map",
                 "profile_weights": "gauss",
-                "scalars": "['dti_fa', 'dti_md']",
+                "scalars": "['dti_fa', 'dti_md', 'dti_rd', 'dti_ad']",
                 "import_tract": "",
                 "sbv_lims_bundles": "[None, None]",
                 "volume_opacity_bundles": 0.3,
@@ -82,8 +82,7 @@
                 "volume_opacity_indiv": 0.3,
                 "n_points_indiv": 40,
                 "viz_backend_spec": "plotly_no_gif",
-                "virtual_frame_buffer": false
-            }
+                "virtual_frame_buffer": false}
         }
     ]
 }
