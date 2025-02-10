@@ -22,7 +22,7 @@ echo $subject
 export SINGULARITYENV_FS_LICENSE=/home/groups/jyeatman/software/freesurfer_license.txt
 export SINGULARITYENV_QSIRECON_ATLAS=/home/users/ethanroy/vanderbilt_colab/Atlas_ROIs
 
-singularity run --cleanenv /home/groups/jyeatman/software/singularity_images/qsiprep-0.19.0.simg \
+singularity run --cleanenv /home/groups/jyeatman/software/singularity_images/qsiprep-0.22.0.simg \
 /scratch/users/ethanroy/longitudinal_vanderbilt_colab/input_fmap_rev \
 /scratch/users/ethanroy/longitudinal_vanderbilt_colab/input_fmap_rev/derivatives  participant --participant-label $subject \
 --recon_input  /scratch/users/ethanroy/longitudinal_vanderbilt_colab/input_fmap_rev/derivatives/qsiprep \
